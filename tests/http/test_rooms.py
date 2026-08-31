@@ -292,6 +292,35 @@ def test_a_lost_counter_bump_costs_one_window_and_not_the_listing(client, monkey
         assert "second" in client.get("/rooms").text, "the clock must expire it regardless"
 
 
+def test_another_workers_write_still_moves_the_rooms_stamp(client, monkeypatch):
+    """The counters are sharded per writer now (#588), so the stamp `/rooms` caches under is a
+    SUM across shards rather than one file — and the sum is what keeps this endpoint correct
+    on more than one worker. A reader that saw only its own shard would hold a listing that is
+    missing every other worker's rooms for a whole window, which in production is four fifths
+    of them.
+    """
+    import os
+
+    import config
+    import store
+
+    # A holder rather than a second `setattr` and `undo`: `undo` would also pop the client
+    # fixture's own patches — the pinned cache windows among them — and the miss that follows
+    # would look exactly like the stamp having moved.
+    worker = {"pid": os.getpid()}
+    monkeypatch.setattr(os, "getpid", lambda: worker["pid"])
+    with config.override(ROOMS_CACHE_SECONDS=60):
+        client.get("/r/first/say/bot/hi")
+        assert "first" in client.get("/rooms").text  # populates the cache under one stamp
+
+        worker["pid"] += 1  # a second worker, writing its own shard
+        client.get("/r/second/say/bot/hi")
+        worker["pid"] -= 1  # and back to the worker that holds the cached listing
+
+        assert len(list(config.ROOT.glob(f"{store.COUNTERS_FILE}.??"))) == 2, "premise: 2 shards"
+        assert "second" in client.get("/rooms").text, "the other worker's write moved no stamp"
+
+
 def test_a_cached_view_is_never_served_under_a_different_root(client, tmp_path):
     """The entries are keyed by `limit` alone, so ROOT is in the stamp — exactly as it is in
     the note gauge's. Production never moves ROOT, but a reconfigured reload and this very

@@ -239,6 +239,43 @@ COUNTER_KEYS = (
     "notes_written",
     "topics_written",
 )
+# One counter file per *writer*, because there is nothing else to shard on. `.seqstate`
+# shards by room name (`_shard`); these six are global scalars with no name in them, so the
+# only axis that separates two concurrent writers is the writer itself. Every worker adds
+# its deltas to its own file and takes only that file's lock; `counters` sums them.
+#
+# `os.getpid() % COUNTER_SHARDS` rather than a hash of the pid, deliberately. Workers are
+# forked in one burst, so their pids are near-consecutive and the modulo spreads them one
+# per shard with no collisions at all — where hashing 5 workers into 8 buckets collides
+# about a third of the time (birthday). Two workers that do collide are not broken, only
+# back to sharing one lock, and a lock shared by 2 of N writers is still a fraction of the
+# queue this replaces. Threads inside one worker share its shard by design: they are the
+# same writer, and at the production rate (~135 writes/s over 5 workers) one worker's own
+# arrivals are a few percent of one lock's capacity.
+#
+# 8, not the 256 `.seqstate` uses, because the two sides of this number are paid by
+# different people. A shard buys write concurrency only up to the number of concurrent
+# WRITERS — WEB_CONCURRENCY, five in production — and there is no sixth process to keep a
+# sixth lock busy. Every shard costs the READER unconditionally: `counters` sums them all,
+# and two of its callers are stamps on hot read paths (`room_stats`'s topic preview stamp,
+# app's note gauge), so one uncached /rooms request pays for three sums. bench/counters.py
+# measures both halves against each other: with 8 writers the write column is flat from 8
+# shards on, within run-to-run noise (5,264 bumps/s at 8, 5,500 at 16, against 2,910
+# unsharded), while the read column doubles for every doubling of the width (202 us at 8,
+# 387 us at 16, against 26 us for the single file).
+COUNTER_SHARDS = 8
+_COUNTER_SHARD_FILES = tuple(f"{COUNTERS_FILE}.{i:02x}" for i in range(COUNTER_SHARDS))
+# The pre-shard file is summed as one more shard, for as long as it exists — which is what
+# makes this change need no migration, no flag day and no operator step. Nothing folds it
+# into a shard and deletes it, and that omission is the design, not a shortcut: a fold is
+# the one operation that can make a summed counter go DOWN (a reader that read the old file
+# before the fold and the shards after it counts a delta twice; one that reads them the
+# other way round misses it), and two of these counters are cache stamps. `_bump` is allowed
+# to lose a delta on a crash — it says so — but a stamp that goes backwards is a different
+# property, and this design never gives one up. A downgrade is likewise better served: the
+# old code reads `.counters` and finds the totals it wrote, where a `.pre-shard` rename
+# would have left it reading zero.
+_COUNTER_FILES = (COUNTERS_FILE, *_COUNTER_SHARD_FILES)
 # Periodic aggregate samples, so growth over a window is answerable at all: the counters
 # above say what the totals are *now*, and nothing but a stored history says what they were
 # a day ago. Kept here rather than in the reader because the service is the only thing that
@@ -678,37 +715,75 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def counters(root: Path) -> dict:
-    """The lifetime counters, with every key present. Read without the lock: the file is
-    replaced atomically, so a reader either sees the old bytes or the new ones."""
+def _read_counters(path: Path) -> dict:
+    """One counter file, with every key present and non-negative.
+
+    Absent, torn, hand-edited and "not an object at all" have to mean the same thing — no
+    counts — because this answers a request: `counters` is read on the `/rooms` and `/stats`
+    paths, and a diagnostic that raises there would take down the endpoint it decorates. The
+    `AttributeError` in the catch is the "not an object" case: a JSON array or scalar has no
+    `.get`, which is precisely the `[]` a hand-edited file arrives as.
+    """
     try:
-        data = orjson.loads((root / COUNTERS_FILE).read_bytes())
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    out = {}
-    for key in COUNTER_KEYS:
-        value = data.get(key, 0)
-        out[key] = value if isinstance(value, int) and value >= 0 else 0
-    return out
+        data = orjson.loads(path.read_bytes())
+        raw = {key: data.get(key, 0) for key in COUNTER_KEYS}
+    except (OSError, ValueError, AttributeError):
+        raw = dict.fromkeys(COUNTER_KEYS, 0)
+    return {k: v if isinstance(v, int) and v >= 0 else 0 for k, v in raw.items()}
+
+
+def counters(root: Path) -> dict:
+    """The lifetime counters, with every key present: the pre-shard file plus every writer
+    shard, summed. Read without any lock, exactly as the single file was — each part is
+    replaced atomically, so a reader sees one part's old bytes or its new ones.
+
+    Summing is not atomic across parts, and does not need to be. Two properties are what the
+    callers actually rely on, and both survive:
+
+      - **Never newer than the disk.** Every shard is read before the caller looks at what it
+        stamped, and a shard only ever grows, so the sum is bounded above by the true total at
+        the instant the last part was read. That is the ordering `_rooms_stamp` is built on —
+        a stamp that cannot be newer than the data the walk then sees, so a stale view is
+        never cached as a fresh one.
+      - **Never decreasing.** Each part is monotonic, and one caller's reads do not overlap
+        each other, so a later sum reads every part at a later instant than the earlier sum
+        did. The stamps at `room_stats` and in app are compared by equality; a value that
+        went backwards could serve a cache entry built before the writes in between. Nothing
+        in this store ever moves a count between two parts, which is the only thing that
+        could break this — see `_COUNTER_FILES`.
+
+    Nine small reads where there was one. That is the price of the write path's lock split, it
+    lands on `/rooms` and `/stats`, and bench/counters.py is where it is measured.
+    """
+    parts = [_read_counters(root / name) for name in _COUNTER_FILES]
+    return {key: sum(part[key] for part in parts) for key in COUNTER_KEYS}
 
 
 def _bump(root: Path, **deltas: int) -> None:
-    """Add to the lifetime counters, atomically.
+    """Add to this writer's own lifetime counter shard, atomically.
+
+    One exclusive lock on one of `COUNTER_SHARDS` files, chosen by pid — never the global
+    lock this used to take on `.counters` itself. Every write in the service came through
+    that one lock (a message append, a note write, the reaper's tally), so writes to
+    unrelated rooms queued behind each other for the length of a read-modify-replace; at
+    ~135 writes/s it was 63-81% of one worker's syscall time (#588). Nothing else here
+    changed: the file is still read, added to and replaced whole under the lock, because the
+    contention was never the size of the file.
 
     Best effort, exactly like `_log_event`: the caller's write has already succeeded by
     the time this runs, so an unwritable counter must never turn that success into an
     error. The cost of that choice is a possible undercount, which is the right way round
     — a digest that reports slightly low is recoverable, a write that 500s is not.
+
+    Deltas for keys outside `COUNTER_KEYS` are dropped rather than stored, so a shard file
+    cannot grow a key `counters` will not read back.
     """
-    path = root / COUNTERS_FILE
+    path = root / _COUNTER_SHARD_FILES[os.getpid() % COUNTER_SHARDS]
     try:
         with _locked(path):
-            current = counters(root)
-            for key, delta in deltas.items():
-                current[key] = current.get(key, 0) + delta
-            _replace(path, orjson.dumps(current))
+            current = _read_counters(path)
+            merged = {key: current[key] + deltas.get(key, 0) for key in COUNTER_KEYS}
+            _replace(path, orjson.dumps(merged))
     except OSError:
         pass
 
