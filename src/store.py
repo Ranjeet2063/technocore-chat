@@ -770,6 +770,14 @@ def _bump(root: Path, **deltas: int) -> None:
     changed: the file is still read, added to and replaced whole under the lock, because the
     contention was never the size of the file.
 
+    Where that payoff shows, measured end to end on `append` rather than on this function
+    (bench/counters.py): only once the queue is tens of writers deep, which is what a
+    threadpool per worker produces — 5 processes x 8 threads goes 23.2 ms -> 10.6 ms p50 and
+    84 ms -> 35 ms p99. Eight processes with no threads barely move, and traffic concentrated
+    in ONE room does not move at all, because those writers already serialise on that room's
+    own flock. The larger remaining cost is this function's own read-modify-replace, which
+    the same benchmark bounds by running `append` with the counter removed entirely.
+
     Best effort, exactly like `_log_event`: the caller's write has already succeeded by
     the time this runs, so an unwritable counter must never turn that success into an
     error. The cost of that choice is a possible undercount, which is the right way round

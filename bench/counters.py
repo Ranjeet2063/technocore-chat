@@ -28,7 +28,16 @@ Three measurements.
    app's note gauge — so an uncached /rooms request pays for three sums. This is the half that
    picks the width: writers want it wide, /rooms wants it narrow.
 
-3. Single-op write latency, uncontended, before and after — the cost of the change to a
+3. The write path end to end, at production's concurrency. `_bump` in isolation overstates
+   the payoff, and eight processes understate it: production runs WEB_CONCURRENCY worker
+   PROCESSES each serving sync handlers from a THREADPOOL, so the queue on the old global
+   lock was tens of writers deep, not five. Sharding by pid divides that queue by the number
+   of workers — threads inside one worker still share its shard, by design — so this is the
+   only measurement that predicts what the deployment sees. It also carries a third column,
+   `store.append` with the counter removed entirely, because the honest reading of a fix is
+   how much of the available headroom it took.
+
+4. Single-op write latency, uncontended, before and after — the cost of the change to a
    writer that was never waiting for anyone.
 
 Builds its own store in a tempfile directory — never read a real one.
@@ -44,6 +53,7 @@ import shutil
 import statistics
 import sys
 import tempfile
+import threading
 import time
 import timeit
 from functools import partial
@@ -56,6 +66,8 @@ import orjson  # noqa: E402
 import store  # noqa: E402
 
 WORKERS = (1, 2, 4, 8)
+WORKERS_LIVE = 5  # WEB_CONCURRENCY in production
+APPENDS = 60  # per thread, for the end-to-end section
 PER_WORKER = 400  # bumps each, enough that a 1-worker run still lasts long enough to time
 WIDTHS = (1, 2, 4, 8, 16, 32, 64, 256)  # 1 is today: the single `.counters` file, unsharded
 SHIPPED = store.COUNTER_SHARDS
@@ -192,6 +204,93 @@ def width_choice() -> None:
     print("  (8 writers, and production runs 5), and the read column is still cheap there.")
 
 
+def _append_proc(root: str, mode: str, threads: int, barrier, out: str) -> None:
+    """One worker process: `threads` threads, each appending to its own room, so nothing here
+    contends on a room lock and the counter is the only thing shared. `mode` is patched after
+    the fork, which is why this benchmark can compare implementations at all."""
+    # Through the module dict, like `_widen`: rebinding a module function is exactly what a
+    # type checker should object to, and swapping the implementation is what this measures.
+    if mode == "global":
+        vars(store)["_bump"] = _global_bump
+    elif mode == "none":
+        vars(store)["_bump"] = lambda *a, **k: None
+    path = Path(root)
+    laps: list[float] = []
+    guard = threading.Lock()
+
+    def one(tid: int) -> None:
+        room = f"r{os.getpid() % 9973:04d}x{tid}"
+        store.append(path, room, "bot", "warm")  # the create is outside the timed section
+        mine = []
+        barrier.wait()
+        for i in range(APPENDS):
+            t0 = time.perf_counter()
+            store.append(path, room, "bot", f"message number {i} with a little padding")
+            mine.append(time.perf_counter() - t0)
+        with guard:
+            laps.extend(mine)
+
+    workers = [threading.Thread(target=one, args=(i,)) for i in range(threads)]
+    start = time.perf_counter()
+    [t.start() for t in workers]
+    [t.join(600) for t in workers]
+    Path(out).write_text(json.dumps({"start": start, "end": time.perf_counter(), "laps": laps}))
+
+
+def _append_run(procs: int, threads: int, mode: str) -> tuple[float, float, float]:
+    context = multiprocessing.get_context("fork")
+    root = Path(tempfile.mkdtemp())
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        # Both throttles satisfied up front: neither the reap pass nor the snapshot is under
+        # test here, and one of them landing inside a run is worth more than every lock in it.
+        (root / ".reaped").touch()
+        (root / store.SNAPSHOTS_FILE).touch()
+        barrier = context.Barrier(procs * threads)
+        running = [
+            context.Process(
+                target=_append_proc, args=(str(root), mode, threads, barrier, str(root / f"a{i}"))
+            )
+            for i in range(procs)
+        ]
+        [p.start() for p in running]
+        [p.join(600) for p in running]
+        assert all(p.exitcode == 0 for p in running), [p.exitcode for p in running]
+        results = [json.loads((root / f"a{i}").read_text()) for i in range(procs)]
+        laps = sorted(lap for r in results for lap in r["laps"])
+        elapsed = max(r["end"] for r in results) - min(r["start"] for r in results)
+        return len(laps) / elapsed, laps[len(laps) // 2] * 1e3, laps[int(len(laps) * 0.99)] * 1e3
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def write_path() -> None:
+    """`store.append` end to end at WORKERS_LIVE processes x T threads — the shape production
+    actually has, and the only one where the lock split shows up in a whole write.
+
+    Read the third column before quoting the second: the counter's own read-modify-replace is
+    the larger cost, and splitting its lock does not touch it. What this change buys is the
+    queue in front of it, which is what #588 measured (63-81% of syscall time in `flock`).
+    """
+    print(f"\nstore.append() end to end, {WORKERS_LIVE} processes x T threads, own room each")
+    print(
+        f"  {'threads':>7}  {'global lock':>26}  {'sharded by writer':>26}  {'no counter at all':>26}"
+    )
+    for threads in (4, 8, 16):
+        row = {m: _append_run(WORKERS_LIVE, threads, m) for m in ("global", "sharded", "none")}
+        print(
+            f"  {threads:>7}  "
+            + "  ".join(
+                f"{row[m][0]:>6,.0f}/s p50 {row[m][1]:>6.2f} p99 {row[m][2]:>7.2f}ms"
+                for m in ("global", "sharded", "none")
+            )
+        )
+    print("  Eight processes with no threads show almost none of this: the lock is only the")
+    print("  constraint once the queue on it is tens of writers deep, which threads are how")
+    print("  this service gets. Traffic concentrated in ONE room shows none of it either —")
+    print("  those writers already serialise on that room's own flock.")
+
+
 def single_write() -> None:
     """The uncontended cost, for completeness: one writer, nobody to wait for."""
     print("\nsingle-op write latency, uncontended")
@@ -220,5 +319,6 @@ if __name__ == "__main__":
         f"python {platform.python_version()}, store shard width {store.COUNTER_SHARDS}"
     )
     throughput()
+    write_path()
     width_choice()
     single_write()
