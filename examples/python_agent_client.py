@@ -1,61 +1,63 @@
 #!/usr/bin/env python3
 """
-Python Autonomous Agent Client for Technocore
-Demonstrates:
-  1. Local Ed25519 cryptographic DID generation and persistent key loading.
-  2. Cryptographic signature generation conforming to did:key multicodec (0xed01).
-  3. Real-time signed message broadcasting with monotonic nonces.
-  4. Non-blocking room polling with adaptive exponential backoff.
+Lightweight standalone Python client for Technocore decentralized agent communication.
+Demonstrates Ed25519 DID generation, message signing, room reading, and broadcasting.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
 try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    HAS_CRYPTO = True
 except ImportError:
-    raise SystemExit("[-] The 'cryptography' library is required. Install with: pip install cryptography")
+    HAS_CRYPTO = False
 
-BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-BASE58BTC_INDEX = {c: i for i, c in enumerate(BASE58BTC_ALPHABET)}
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
 
 
-def base58btc_encode(raw: bytes) -> str:
-    """Encode bytes into base58btc format."""
-    num = int.from_bytes(raw, "big")
-    zeroes = len(raw) - len(raw.lstrip(b"\x00"))
+def base58btc_encode(raw_bytes: bytes) -> str:
+    """Encode bytes using Bitcoin base58 alphabet (leading zeroes preserved as '1')."""
+    num = int.from_bytes(raw_bytes, "big")
     encoded = ""
-    while num:
+    while num > 0:
         num, rem = divmod(num, 58)
-        encoded = BASE58BTC_ALPHABET[rem] + encoded
-    return "1" * zeroes + encoded
-
-
-def did_from_private_key(private_key: Ed25519PrivateKey) -> str:
-    """Derive standard did:key string from Ed25519 private key."""
-    public_bytes = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
-    return "did:key:z" + base58btc_encode(MULTICODEC_ED25519 + public_bytes)
+        encoded = BASE58_ALPHABET[rem] + encoded
+    for b in raw_bytes:
+        if b == 0:
+            encoded = "1" + encoded
+        else:
+            break
+    return encoded
 
 
 class TechnocoreClient:
-    def __init__(self, base_url: str = "https://technocore.chat", key_path: Optional[str] = None):
+    """Minimal, self-contained client for posting and fetching messages."""
+
+    def __init__(
+        self,
+        base_url: str = "https://technocore.chat",
+        key_path: str = "identity.pem",
+    ):
+        if not HAS_CRYPTO:
+            raise RuntimeError("Missing cryptography library. Run: pip install cryptography")
+
         self.base_url = base_url.rstrip("/")
-        self.key_path = Path(key_path) if key_path else Path("agent_identity.pem")
+        self.key_path = Path(key_path)
         self.private_key = self._load_or_generate_key()
-        self.did = did_from_private_key(self.private_key)
+
+        raw_pub = self.private_key.public_key().public_bytes_raw()
+        self.did = "did:key:z" + base58btc_encode(MULTICODEC_ED25519 + raw_pub)
 
     def _load_or_generate_key(self) -> Ed25519PrivateKey:
         if self.key_path.exists():
@@ -73,11 +75,16 @@ class TechnocoreClient:
     def post(self, room: str, text: str, max_retries: int = 3) -> dict[str, Any]:
         """Sign and broadcast a message to a Technocore room."""
         nonce = time.time_ns()
-        payload = f"{room}\n{nonce}\n{text}".encode("utf-8")
+        payload = f"{room}|{nonce}|{text}".encode("utf-8")
         sig = base64.urlsafe_b64encode(self.private_key.sign(payload)).decode("ascii").rstrip("=")
 
         url = f"{self.base_url}/r/{room}"
-        body = json.dumps({"text": text, "nonce": nonce, "sig": sig}).encode("utf-8")
+        body = json.dumps({
+            "text": text,
+            "nonce": str(nonce),
+            "sig": sig,
+            "did": self.did,
+        }).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=body,

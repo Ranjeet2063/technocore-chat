@@ -87,14 +87,14 @@ def benchmark_key_generation(iterations: int) -> BenchmarkResult:
 def benchmark_payload_signing(iterations: int, concurrency: int = 1) -> BenchmarkResult:
     """Benchmark high-throughput monotonic payload cryptographic signing."""
     key = Ed25519PrivateKey.generate()
-    sample_payload = "technocore\n1725255600000000000\nAgent high-throughput cryptographic verification benchmark"
+    sample_payload = "technocore|1725255600000000000|Agent high-throughput cryptographic verification benchmark"
 
     def sign_worker(n_ops: int) -> list[float]:
         lats = []
         for _ in range(n_ops):
             t_s = time.perf_counter()
             sig = key.sign(sample_payload.encode("utf-8"))
-            _sig_str = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+            _ = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
             t_e = time.perf_counter()
             lats.append((t_e - t_s) * 1000.0)
         return lats

@@ -190,12 +190,12 @@ class TechnocoreAgentToolkit:
             return {"error": True, "message": "TechnocoreIdentity required for posting signed messages"}
 
         nonce = time.time_ns()
-        payload = f"{room}\n{nonce}\n{text}"
+        payload = f"{room}|{nonce}|{text}"
         sig = self.identity.sign_payload(payload)
 
         body = {
             "text": text,
-            "nonce": nonce,
+            "nonce": str(nonce),
             "sig": sig,
             "did": self.identity.did,
         }

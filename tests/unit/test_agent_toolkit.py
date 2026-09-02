@@ -8,10 +8,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Add examples directory to path for import
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "examples"))
+# Add src and examples directory to path for import
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT_DIR / "examples"))
+sys.path.insert(0, str(ROOT_DIR / "src"))
 
 import pytest
+import didkey
+from python_agent_client import TechnocoreClient
 from technocore_agent_toolkit import (
     AgentMessage,
     TechnocoreAgentToolkit,
@@ -37,16 +41,57 @@ def test_identity_deterministic_derivation():
     assert len(id1.did) > 40
 
 
-def test_signature_generation():
-    """Verify cryptographic signatures are non-empty and URL-safe."""
+def test_signature_generation_and_server_canonical_verification():
+    """Verify cryptographic signatures match server-side canonical pipe verification."""
     seed = bytes([7] * 32)
     identity = TechnocoreIdentity(seed_bytes=seed)
-    payload = "technocore\n1000\nHello decentralized world"
+    room = "technocore"
+    nonce = 1725255600000000000
+    text = "Hello decentralized world"
+
+    # Server canonical signed payload delimiter is pipe (|)
+    payload = f"{room}|{nonce}|{text}"
     sig = identity.sign_payload(payload)
 
     assert isinstance(sig, str)
     assert len(sig) > 0
     assert not sig.endswith("=")  # URL-safe stripped padding
+
+    # Verify against Technocore server didkey verification routine
+    didkey.verify(identity.did, sig, payload)
+
+
+def test_python_agent_client_post_payload_shape(monkeypatch, tmp_path):
+    """Verify standalone Python client formats POST body with did, sig, nonce, and text."""
+    key_file = tmp_path / "test_identity.pem"
+    client = TechnocoreClient(key_path=str(key_file))
+
+    posted_request = {}
+
+    def mock_urlopen(req, timeout=10):
+        import io
+        import json
+        posted_request["url"] = req.full_url
+        posted_request["body"] = json.loads(req.data.decode("utf-8"))
+        res_body = json.dumps({"ok": True, "posted": {"seq": 9999}}).encode("utf-8")
+        return io.BytesIO(res_body)
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    receipt = client.post("testroom", "Verification message body")
+    assert receipt["ok"] is True
+    assert receipt["posted"]["seq"] == 9999
+
+    body = posted_request["body"]
+    assert body["did"] == client.did
+    assert body["text"] == "Verification message body"
+    assert "sig" in body
+    assert "nonce" in body
+
+    # Verify that the signature inside the POST body verifies under the canonical payload
+    canonical_payload = f"testroom|{body['nonce']}|{body['text']}"
+    didkey.verify(body["did"], body["sig"], canonical_payload)
 
 
 def test_agent_message_dataclass():
