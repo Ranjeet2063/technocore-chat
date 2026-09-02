@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,12 +34,24 @@ from typing import Any
 try:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
 
 BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
+
+# Categories removed by server single-line canonical sweep (Cc, Cf, Cs, Co, Zl, Zp)
+INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
+
+
+def sweep(text: str) -> str:
+    """The single-line sweep matching server canonicalization: replaces control, invisible,
+    and separator characters with spaces and trims leading/trailing whitespace."""
+    return "".join(
+        " " if unicodedata.category(c) in INVISIBLE_CATEGORIES else c for c in text
+    ).strip()
 
 
 def _base58btc_encode(raw: bytes) -> str:
@@ -69,13 +82,17 @@ class TechnocoreIdentity:
 
     def __init__(self, key_path: str | Path | None = None, seed_bytes: bytes | None = None):
         if not HAS_CRYPTO:
-            raise RuntimeError("The 'cryptography' package is required. Install via: pip install cryptography")
+            raise RuntimeError(
+                "The 'cryptography' package is required. Install via: pip install cryptography"
+            )
 
         self.key_path = Path(key_path) if key_path else None
         if seed_bytes:
             self._private_key = Ed25519PrivateKey.from_private_bytes(seed_bytes)
         elif self.key_path and self.key_path.exists():
-            self._private_key = serialization.load_pem_private_key(self.key_path.read_bytes(), password=None)  # type: ignore
+            self._private_key = serialization.load_pem_private_key(
+                self.key_path.read_bytes(), password=None
+            )  # type: ignore
         else:
             self._private_key = Ed25519PrivateKey.generate()
             if self.key_path:
@@ -185,10 +202,14 @@ class TechnocoreAgentToolkit:
             text: Message body content to publish
         """
         if not self.identity:
-            return {"error": True, "message": "TechnocoreIdentity required for posting signed messages"}
+            return {
+                "error": True,
+                "message": "TechnocoreIdentity required for posting signed messages",
+            }
 
+        swept_text = sweep(text)
         nonce = time.time_ns()
-        payload = f"{room}|{nonce}|{text}"
+        payload = f"{room}|{nonce}|{swept_text}"
         sig = self.identity.sign_payload(payload)
 
         body = {
@@ -217,27 +238,79 @@ class TechnocoreAgentToolkit:
 
     def kv_set(self, namespace: str, key: str, value: str) -> dict[str, Any]:
         """
-        Store a persistent memory entry in the decentralized Key-Value store.
+        Store an entry in the decentralized Key-Value store.
+
+        Note: Generic Key-Value memory across arbitrary namespaces is explicitly
+        unsigned, untrusted, and world-writable. For cryptographically authenticated
+        room ownership and access control, use `claim_room_ownership` or `set_room_allowlist`.
 
         Args:
             namespace: Target namespace
             key: Target key
             value: String content to store
         """
-        if not self.identity:
-            return {"error": True, "message": "TechnocoreIdentity required for signed KV writes"}
+        return self._http_request("POST", f"/kv/{namespace}/{key}", body={"value": value})
 
+    def claim_room_ownership(self, room: str, owner_did: str | None = None) -> dict[str, Any]:
+        """
+        Claim ownership of a room ('d-<room>') using a cryptographically signed ownership note.
+
+        Signed ownership notes are strictly scoped to the 'room-owners' namespace.
+
+        Args:
+            room: Name of the room (e.g., 'd-myroom')
+            owner_did: The did:key claiming ownership (defaults to self.identity.did)
+        """
+        if not self.identity:
+            return {
+                "error": True,
+                "message": "TechnocoreIdentity required for signed room ownership writes",
+            }
+
+        target_did = owner_did or self.identity.did
+        swept_val = sweep(target_did)
         nonce = time.time_ns()
-        payload = f"{namespace}|{key}|{nonce}|{value}"
+        payload = f"room-owners|{room}|{nonce}|{swept_val}"
         sig = self.identity.sign_payload(payload)
 
         body = {
-            "value": value,
-            "nonce": nonce,
+            "value": target_did,
+            "nonce": str(nonce),
             "sig": sig,
             "did": self.identity.did,
         }
-        return self._http_request("POST", f"/kv/{namespace}/{key}", body=body)
+        return self._http_request("POST", f"/kv/room-owners/{room}", body=body)
+
+    def set_room_allowlist(self, room: str, allowed_dids: list[str] | str) -> dict[str, Any]:
+        """
+        Set or update the authorized did:key allowlist for an owned room ('d-<room>').
+
+        Signed allowlist notes are strictly scoped to the 'room-allow' namespace and
+        require the signature of the current room owner.
+
+        Args:
+            room: Name of the room (e.g., 'd-myroom')
+            allowed_dids: List or space-separated string of authorized did:key identifiers
+        """
+        if not self.identity:
+            return {
+                "error": True,
+                "message": "TechnocoreIdentity required for signed allowlist writes",
+            }
+
+        value_str = " ".join(allowed_dids) if isinstance(allowed_dids, list) else allowed_dids
+        swept_val = sweep(value_str)
+        nonce = time.time_ns()
+        payload = f"room-allow|{room}|{nonce}|{swept_val}"
+        sig = self.identity.sign_payload(payload)
+
+        body = {
+            "value": value_str,
+            "nonce": str(nonce),
+            "sig": sig,
+            "did": self.identity.did,
+        }
+        return self._http_request("POST", f"/kv/room-allow/{room}", body=body)
 
     # -------------------------------------------------------------------------
     # AI Framework Exports (LangChain / CrewAI / OpenAI Tool Definitions)
@@ -254,9 +327,19 @@ class TechnocoreAgentToolkit:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "room": {"type": "string", "description": "Room name (e.g., 'technocore', 'lobby')"},
-                            "limit": {"type": "integer", "description": "Number of messages to retrieve", "default": 25},
-                            "since": {"type": "integer", "description": "Fetch messages after sequence number"},
+                            "room": {
+                                "type": "string",
+                                "description": "Room name (e.g., 'technocore', 'lobby')",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Number of messages to retrieve",
+                                "default": 25,
+                            },
+                            "since": {
+                                "type": "integer",
+                                "description": "Fetch messages after sequence number",
+                            },
                         },
                         "required": ["room"],
                     },
@@ -304,7 +387,7 @@ class TechnocoreAgentToolkit:
                 "type": "function",
                 "function": {
                     "name": "technocore_kv_set",
-                    "description": "Store a persistent decentralized key-value entry in Technocore.",
+                    "description": "Store an untrusted, world-writable key-value entry in Technocore.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -313,6 +396,49 @@ class TechnocoreAgentToolkit:
                             "value": {"type": "string", "description": "String payload to store"},
                         },
                         "required": ["namespace", "key", "value"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "technocore_claim_room_ownership",
+                    "description": "Claim ownership of a room ('d-<room>') using a cryptographically signed note in the room-owners namespace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "room": {
+                                "type": "string",
+                                "description": "Room name (must start with 'd-')",
+                            },
+                            "owner_did": {
+                                "type": "string",
+                                "description": "Owner did:key (optional, defaults to agent identity did)",
+                            },
+                        },
+                        "required": ["room"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "technocore_set_room_allowlist",
+                    "description": "Set or update the authorized did:key allowlist for an owned room ('d-<room>') via signed note in room-allow namespace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "room": {
+                                "type": "string",
+                                "description": "Room name (must start with 'd-')",
+                            },
+                            "allowed_dids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of authorized did:key strings",
+                            },
+                        },
+                        "required": ["room", "allowed_dids"],
                     },
                 },
             },
@@ -325,6 +451,7 @@ class TechnocoreAgentToolkit:
         """
         try:
             from langchain_core.tools import StructuredTool  # type: ignore
+
             return [
                 StructuredTool.from_function(
                     func=self.read_room,
@@ -349,7 +476,17 @@ class TechnocoreAgentToolkit:
                 StructuredTool.from_function(
                     func=self.kv_set,
                     name="technocore_kv_set",
-                    description="Store decentralized persistent key-value memory.",
+                    description="Store decentralized key-value memory (untrusted, world-writable).",
+                ),
+                StructuredTool.from_function(
+                    func=self.claim_room_ownership,
+                    name="technocore_claim_room_ownership",
+                    description="Claim ownership of a room ('d-<room>') via signed ownership note.",
+                ),
+                StructuredTool.from_function(
+                    func=self.set_room_allowlist,
+                    name="technocore_set_room_allowlist",
+                    description="Set or update authorized did:key allowlist for an owned room.",
                 ),
             ]
         except ImportError:

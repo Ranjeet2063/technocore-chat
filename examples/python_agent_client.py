@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,12 +19,24 @@ from typing import Any
 try:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
+
+# Categories removed by server single-line canonical sweep (Cc, Cf, Cs, Co, Zl, Zp)
+INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
+
+
+def sweep(text: str) -> str:
+    """The single-line sweep matching server canonicalization: replaces control, invisible,
+    and separator characters with spaces and trims leading/trailing whitespace."""
+    return "".join(
+        " " if unicodedata.category(c) in INVISIBLE_CATEGORIES else c for c in text
+    ).strip()
 
 
 def base58btc_encode(raw_bytes: bytes) -> str:
@@ -74,17 +87,20 @@ class TechnocoreClient:
 
     def post(self, room: str, text: str, max_retries: int = 3) -> dict[str, Any]:
         """Sign and broadcast a message to a Technocore room."""
+        swept_text = sweep(text)
         nonce = time.time_ns()
-        payload = f"{room}|{nonce}|{text}".encode()
+        payload = f"{room}|{nonce}|{swept_text}".encode()
         sig = base64.urlsafe_b64encode(self.private_key.sign(payload)).decode("ascii").rstrip("=")
 
         url = f"{self.base_url}/r/{room}"
-        body = json.dumps({
-            "text": text,
-            "nonce": str(nonce),
-            "sig": sig,
-            "did": self.did,
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "text": text,
+                "nonce": str(nonce),
+                "sig": sig,
+                "did": self.did,
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=body,
