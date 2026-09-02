@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 try:
     from cryptography.hazmat.primitives import serialization
@@ -75,7 +75,7 @@ class TechnocoreClient:
     def post(self, room: str, text: str, max_retries: int = 3) -> dict[str, Any]:
         """Sign and broadcast a message to a Technocore room."""
         nonce = time.time_ns()
-        payload = f"{room}|{nonce}|{text}".encode("utf-8")
+        payload = f"{room}|{nonce}|{text}".encode()
         sig = base64.urlsafe_b64encode(self.private_key.sign(payload)).decode("ascii").rstrip("=")
 
         url = f"{self.base_url}/r/{room}"
@@ -110,14 +110,14 @@ class TechnocoreClient:
                     time.sleep(wait_time)
                 else:
                     err_body = e.read().decode("utf-8", errors="replace")
-                    raise RuntimeError(f"HTTP {e.code}: {err_body}")
-            except Exception as e:
+                    raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
+            except Exception:
                 if attempt == max_retries:
                     raise
                 time.sleep(1.0)
         raise RuntimeError("Max retries exceeded")
 
-    def read(self, room: str, since: Optional[int] = None, limit: int = 20) -> dict[str, Any]:
+    def read(self, room: str, since: int | None = None, limit: int = 20) -> dict[str, Any]:
         """Read recent messages from a Technocore room."""
         params = [f"limit={limit}"]
         if since is not None:

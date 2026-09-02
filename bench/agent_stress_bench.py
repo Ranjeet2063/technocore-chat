@@ -18,7 +18,6 @@ import concurrent.futures
 import statistics
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
 
 try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

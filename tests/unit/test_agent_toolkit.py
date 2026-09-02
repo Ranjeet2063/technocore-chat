@@ -13,15 +13,15 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT_DIR / "examples"))
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
-import pytest
-import didkey
-from python_agent_client import TechnocoreClient
-from technocore_agent_toolkit import (
+from python_agent_client import TechnocoreClient  # noqa: E402
+from technocore_agent_toolkit import (  # noqa: E402
     AgentMessage,
     TechnocoreAgentToolkit,
     TechnocoreIdentity,
     _base58btc_encode,
 )
+
+import didkey  # noqa: E402
 
 
 def test_base58btc_encode_basic():

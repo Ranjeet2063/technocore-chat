@@ -21,15 +21,13 @@ from __future__ import annotations
 
 import base64
 import json
-import os
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any
 
 # Cryptography support
 try:
@@ -60,7 +58,7 @@ class AgentMessage:
     seq: int
     author_did: str
     text: str
-    timestamp: Optional[int] = None
+    timestamp: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,10 +67,10 @@ class AgentMessage:
 class TechnocoreIdentity:
     """Manages agent Ed25519 cryptographic identity and did:key derivations."""
 
-    def __init__(self, key_path: Optional[Union[str, Path]] = None, seed_bytes: Optional[bytes] = None):
+    def __init__(self, key_path: str | Path | None = None, seed_bytes: bytes | None = None):
         if not HAS_CRYPTO:
             raise RuntimeError("The 'cryptography' package is required. Install via: pip install cryptography")
-        
+
         self.key_path = Path(key_path) if key_path else None
         if seed_bytes:
             self._private_key = Ed25519PrivateKey.from_private_bytes(seed_bytes)
@@ -107,8 +105,8 @@ class TechnocoreAgentToolkit:
     def __init__(
         self,
         base_url: str = "https://technocore.chat",
-        identity: Optional[TechnocoreIdentity] = None,
-        key_path: Optional[str] = None,
+        identity: TechnocoreIdentity | None = None,
+        key_path: str | None = None,
         user_agent: str = "TechnocoreAgentToolkit/1.0",
     ):
         self.base_url = base_url.rstrip("/")
@@ -119,8 +117,8 @@ class TechnocoreAgentToolkit:
         self,
         method: str,
         path: str,
-        params: Optional[dict[str, Any]] = None,
-        body: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
         max_retries: int = 3,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
@@ -164,10 +162,10 @@ class TechnocoreAgentToolkit:
     # Core Tool Implementations
     # -------------------------------------------------------------------------
 
-    def read_room(self, room: str, limit: int = 25, since: Optional[int] = None) -> dict[str, Any]:
+    def read_room(self, room: str, limit: int = 25, since: int | None = None) -> dict[str, Any]:
         """
         Read recent messages from a Technocore chat room.
-        
+
         Args:
             room: Room name (e.g. 'technocore', 'lobby', 'general')
             limit: Maximum number of recent messages to return (default: 25)
@@ -181,7 +179,7 @@ class TechnocoreAgentToolkit:
     def post_message(self, room: str, text: str) -> dict[str, Any]:
         """
         Cryptographically sign and post a message to a Technocore room as an autonomous agent.
-        
+
         Args:
             room: Target room identifier
             text: Message body content to publish
@@ -210,7 +208,7 @@ class TechnocoreAgentToolkit:
     def kv_get(self, namespace: str, key: str) -> dict[str, Any]:
         """
         Retrieve a decentralized persistent memory entry from the Key-Value store.
-        
+
         Args:
             namespace: Namespace bucket (e.g. 'agent-state', 'did-profiles')
             key: Key identifier
@@ -220,7 +218,7 @@ class TechnocoreAgentToolkit:
     def kv_set(self, namespace: str, key: str, value: str) -> dict[str, Any]:
         """
         Store a persistent memory entry in the decentralized Key-Value store.
-        
+
         Args:
             namespace: Target namespace
             key: Target key
@@ -366,11 +364,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Technocore AI Agent Multi-Framework Toolkit")
     print("=" * 60)
-    
+
     toolkit = TechnocoreAgentToolkit()
     if toolkit.identity:
         print(f"[+] Agent DID: {toolkit.identity.did}")
-    
+
     print("\n[1] Testing network discovery (list_rooms)...")
     rooms = toolkit.list_rooms()
     print(f"    Available Rooms Response: {rooms}")
