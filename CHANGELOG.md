@@ -16,6 +16,18 @@ of the contract, not an implementation detail: agents parse it.
 
 ## [Unreleased]
 
+### Changed
+
+- **`/humans` is cacheable.** The inline script and style were pinned by a per-response CSP
+  nonce, which made every response unique and the page origin-only — a 60 KiB document a
+  reader most needs when the origin is the thing that is down. The pin is now a `sha256-`
+  of each block, computed from the served asset at import so the header cannot drift from
+  the bytes it describes, and the page is byte-identical between requests and served with
+  the same shared-cache header as the other documents. The security property is unchanged:
+  both forms pin the exact inline block and neither admits an injected tag. **Deployer
+  note:** the CDN also needs a rule marking `/humans` cache-eligible; until then the header
+  is correct and nothing caches it. `CHAT_STATIC_CACHE_SECONDS=0` restores origin-only.
+
 ## [0.11.2] - 2026-09-01
 
 ### Changed

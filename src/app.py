@@ -11,8 +11,10 @@ Not part of the FLOP protocol. Satellite service, ephemeral by design.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import re
 import secrets
 import time
 import tomllib
@@ -98,6 +100,23 @@ def _asset(name: str) -> str:
 
 
 HUMANS = _asset("humans.html")
+
+
+# The inline blocks of the one page this service renders, as CSP `sha256-` sources.
+#
+# Derived from the asset rather than written down beside it. A hash that does not match its
+# block is not a degraded page: the browser refuses that block outright and the document
+# renders inert, so a digest kept by hand is one that silently breaks the page on any
+# whitespace edit. Exactly one <script> and one <style> is a contract the page's own test
+# asserts, which is why this maps tag -> source rather than accumulating a list.
+#
+# Replaces a per-response nonce. Both pin the exact block and neither admits an injected
+# tag; the nonce also made every response unique, which made a 60 KiB document origin-only.
+_INLINE_BLOCK = re.compile(r"<(script|style)\b[^>]*>(.*?)</\1>", re.DOTALL)
+HUMANS_CSP_SOURCES = {
+    tag: f"'sha256-{base64.b64encode(hashlib.sha256(body.encode()).digest()).decode()}'"
+    for tag, body in _INLINE_BLOCK.findall(HUMANS)
+}
 # The published API version, read from the one file that already declares it. A version
 # in a manifest is a claim a machine reader acts on, so it is not worth a second copy that
 # can lag a release by exactly one commit.
@@ -1723,21 +1742,27 @@ def humans(request: Request) -> Response:
 
     It is a *static* file: no message ever passes through the server into markup. The page
     fetches `?format=json` and renders every field with `textContent`, so hostile input is
-    text by construction rather than by escaping. A per-response nonce pins the inline
+    text by construction rather than by escaping. A `sha256-` CSP source pins the inline
     script and style, so even an injected tag could not execute.
+
+    The pin used to be a per-response nonce, which pinned the blocks just as tightly but
+    made every response unique — so the one 60 KiB document here could never be shared by
+    the edge, and had to come from the origin even when the origin was the thing that was
+    down. Hashing the blocks instead makes the response byte-identical between requests,
+    which is what lets `_static_cacheable` mean anything. The CDN also needs a rule marking
+    this path cache-eligible; without it the header is honoured by nobody.
     """
-    nonce = secrets.token_urlsafe(16)
-    return Response(
-        HUMANS.replace("__NONCE__", nonce),
+    resp = Response(
+        HUMANS,
         media_type="text/html; charset=utf-8",
         headers={
             "Content-Security-Policy": (
                 f"default-src 'none'; connect-src 'self'; img-src 'self' data:; "
-                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                f"script-src {HUMANS_CSP_SOURCES['script']}; "
+                f"style-src {HUMANS_CSP_SOURCES['style']}; "
                 f"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
             ),
             "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
             "Referrer-Policy": "no-referrer",
             # The three service pointers the document lanes carry, in the header rather
             # than in the body. This page was the one response with no reason to advertise
@@ -1754,6 +1779,7 @@ def humans(request: Request) -> Response:
             "Link": manifest.link_header(_base_url(request)),
         },
     )
+    return _static_cacheable(resp)
 
 
 def robots(request: Request) -> Response:
