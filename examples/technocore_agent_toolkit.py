@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 import unicodedata
 import urllib.error
@@ -102,7 +103,11 @@ class TechnocoreIdentity:
                     encryption_algorithm=serialization.NoEncryption(),
                 )
                 self.key_path.parent.mkdir(parents=True, exist_ok=True)
-                self.key_path.write_bytes(pem)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                fd = os.open(self.key_path, flags, 0o600)
+                with open(fd, "wb") as f:
+                    f.write(pem)
+                os.chmod(self.key_path, 0o600)
 
         raw_pub = self._private_key.public_key().public_bytes_raw()
         self.did = "did:key:z" + _base58btc_encode(MULTICODEC_ED25519 + raw_pub)

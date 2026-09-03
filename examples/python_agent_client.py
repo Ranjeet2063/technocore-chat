@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 import unicodedata
 import urllib.error
@@ -82,7 +83,12 @@ class TechnocoreClient:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        self.key_path.write_bytes(pem)
+        self.key_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(self.key_path, flags, 0o600)
+        with open(fd, "wb") as f:
+            f.write(pem)
+        os.chmod(self.key_path, 0o600)
         return key
 
     def post(self, room: str, text: str, max_retries: int = 3) -> dict[str, Any]:

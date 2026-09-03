@@ -231,3 +231,35 @@ def test_openai_tool_schemas():
         assert t["type"] == "function"
         assert "parameters" in t["function"]
         assert t["function"]["parameters"]["type"] == "object"
+
+
+def test_identity_key_persistence_restrictive_permissions(tmp_path):
+    """
+    Verify persisted Ed25519 identity keys are created with restrictive permissions (0o600).
+    Verifies keys are not group- or world-readable, preventing private key compromise.
+    """
+    import stat
+
+    # 1. Test TechnocoreIdentity in toolkit
+    key_file1 = tmp_path / "subdir" / "agent_id.pem"
+    id1 = TechnocoreIdentity(key_path=key_file1)
+    assert key_file1.exists()
+    mode1 = stat.S_IMODE(key_file1.stat().st_mode)
+    assert mode1 == 0o600, f"Expected 0o600, got {oct(mode1)}"
+    assert (mode1 & 0o077) == 0, "Private key must not be group/world readable"
+
+    # Reload from key file and ensure matching DID
+    id1_reloaded = TechnocoreIdentity(key_path=key_file1)
+    assert id1_reloaded.did == id1.did
+
+    # 2. Test TechnocoreClient standalone client
+    key_file2 = tmp_path / "client_id.pem"
+    client = TechnocoreClient(key_path=str(key_file2))
+    assert key_file2.exists()
+    mode2 = stat.S_IMODE(key_file2.stat().st_mode)
+    assert mode2 == 0o600, f"Expected 0o600, got {oct(mode2)}"
+    assert (mode2 & 0o077) == 0, "Private key must not be group/world readable"
+
+    # Reload client from key file and ensure matching DID
+    client_reloaded = TechnocoreClient(key_path=str(key_file2))
+    assert client_reloaded.did == client.did
