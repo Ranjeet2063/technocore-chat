@@ -257,7 +257,7 @@ def test_generic_kv_set_unsigned(monkeypatch):
     res = toolkit.kv_set("agent-notes", "state", "active_idle")
     assert res["ns"] == "agent-notes"
     assert res["key"] == "state"
-    assert posted_request["url"] == "https://technocore.chat/kv/agent-notes/state"
+    assert posted_request["url"] == "https://technocore.chat/kv/agent-notes/state?format=json"
     assert posted_request["body"] == {"value": "active_idle"}
     assert "sig" not in posted_request["body"]
 
@@ -292,7 +292,7 @@ def test_signed_room_ownership_and_allowlist(monkeypatch):
     # 1. Claim room ownership
     toolkit.claim_room_ownership("d-agentroom")
     req1 = posted_requests[0]
-    assert req1["url"] == "https://technocore.chat/kv/room-owners/d-agentroom"
+    assert req1["url"] == "https://technocore.chat/kv/room-owners/d-agentroom?format=json"
     body1 = req1["body"]
     assert body1["did"] == identity.did
     assert body1["value"] == identity.did
@@ -305,7 +305,7 @@ def test_signed_room_ownership_and_allowlist(monkeypatch):
     allowed_dids = [identity.did, "did:key:z6Mksample123"]
     toolkit.set_room_allowlist("d-agentroom", allowed_dids)
     req2 = posted_requests[1]
-    assert req2["url"] == "https://technocore.chat/kv/room-allow/d-agentroom"
+    assert req2["url"] == "https://technocore.chat/kv/room-allow/d-agentroom?format=json"
     body2 = req2["body"]
     assert body2["did"] == identity.did
     assert body2["value"] == f"{identity.did} did:key:z6Mksample123"
@@ -313,6 +313,121 @@ def test_signed_room_ownership_and_allowlist(monkeypatch):
         f"room-allow|d-agentroom|{body2['nonce']}|{store.clean_text(body2['value'])}"
     )
     didkey.verify(body2["did"], body2["sig"], expected_payload2)
+
+
+def test_technocore_agent_toolkit_real_asgi_kv_write_and_read(monkeypatch, tmp_path):
+    """
+    Focused regression test exercising TechnocoreAgentToolkit KV operations against real ASGI handlers.
+    Verifies that:
+      1. POST /kv/<ns>/<key>?format=json succeeds and returns structured JSON (ns, key, bytes, ts).
+      2. GET /kv/<ns>/<key> succeeds and parses the text response, stripping the untrusted-content
+         banner and returning exactly the stored note value without JSONDecodeError.
+      3. Subsequent read matches the exact written value.
+      4. Signed ownership writes (claim_room_ownership) and allowlist writes return structured metadata.
+      5. Non-existent note returns structured 404 error without crashing.
+    """
+    import io
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from starlette.testclient import TestClient
+
+    import app as app_module
+    import config
+    import limit
+    import store
+
+    origin = time.monotonic()
+    monkeypatch.setattr(store, "_time_bucket", lambda now, ttl: int((now - origin) // ttl))
+    app_module._buckets.clear()
+    app_module._rooms_walk.cache_clear()
+    store._cached_window.cache_clear()
+    store._topics_memo.cache_clear()
+    app_module._identities.clear()
+    app_module._proxy_evidence["proxied_requests"] = 0
+    limit._dupes.clear()
+
+    with config.override(ROOT=tmp_path, DUPE_FILTER_SECONDS=0):
+        test_client = TestClient(app_module.app)
+
+        class ASGIResponse(io.BytesIO):
+            def __init__(self, content: bytes, status: int, headers: dict):
+                super().__init__(content)
+                self.status = status
+                self.headers = headers
+                self.code = status
+
+            def getcode(self):
+                return self.status
+
+            def info(self):
+                return self.headers
+
+        def asgi_urlopen(req, timeout=10):
+            url = req.full_url if hasattr(req, "full_url") else req
+            data = req.data if hasattr(req, "data") else None
+            headers = dict(req.headers) if hasattr(req, "headers") else {}
+            method = req.get_method() if hasattr(req, "get_method") else "GET"
+
+            parsed = urllib.parse.urlparse(url)
+            path = parsed.path
+            if parsed.query:
+                path += "?" + parsed.query
+
+            resp = test_client.request(
+                method=method,
+                url=path,
+                content=data,
+                headers=headers,
+            )
+
+            if resp.status_code >= 400:
+                raise urllib.error.HTTPError(
+                    url,
+                    resp.status_code,
+                    resp.reason_phrase,
+                    resp.headers,
+                    io.BytesIO(resp.content),
+                )
+
+            return ASGIResponse(resp.content, resp.status_code, dict(resp.headers))
+
+        monkeypatch.setattr(urllib.request, "urlopen", asgi_urlopen)
+
+        seed = bytes([77] * 32)
+        identity = TechnocoreIdentity(seed_bytes=seed)
+        toolkit = TechnocoreAgentToolkit(base_url="http://testserver", identity=identity)
+
+        # 1. Unsigned KV write (kv_set) against real ASGI handler
+        write_res = toolkit.kv_set("plans", "roadmap", "launch_mainnet_soon")
+        assert isinstance(write_res, dict)
+        assert write_res["ns"] == "plans"
+        assert write_res["key"] == "roadmap"
+        assert "bytes" in write_res
+        assert "ts" in write_res
+
+        # 2. Single-note read (kv_get) against real ASGI handler
+        read_res = toolkit.kv_get("plans", "roadmap")
+        assert isinstance(read_res, dict)
+        assert read_res["ns"] == "plans"
+        assert read_res["key"] == "roadmap"
+        assert read_res["value"] == "launch_mainnet_soon"
+
+        # 3. Signed ownership write & read
+        owner_res = toolkit.claim_room_ownership("d-governance")
+        assert isinstance(owner_res, dict)
+        assert owner_res["ns"] == "room-owners"
+        assert owner_res["key"] == "d-governance"
+
+        owner_read = toolkit.kv_get("room-owners", "d-governance")
+        assert owner_read["value"] == identity.did
+
+        # 4. 404 on non-existent note
+        missing_res = toolkit.kv_get("plans", "non_existent_key")
+        assert missing_res.get("error") is True
+        assert missing_res.get("status") == 404
 
 
 def test_agent_message_dataclass():

@@ -135,6 +135,26 @@ class TechnocoreAgentToolkit:
         self.identity = identity or (TechnocoreIdentity(key_path=key_path) if HAS_CRYPTO else None)
         self.user_agent = user_agent
 
+    @staticmethod
+    def _parse_note_value(body: str) -> str:
+        """
+        Parse raw single-note text response from GET /kv/<ns>/<key>.
+        The server responds with:
+          1. Untrusted content banner ('!! UNTRUSTED CONTENT...')
+          2. A blank line
+          3. Stored note value (single-line by construction via clean_text)
+          4. Optional trailing '# budget:' note if read budget is nearly spent.
+        Extracts exactly the stored note value byte-for-byte.
+        """
+        lines = body.split("\n")
+        if len(lines) >= 2 and lines[0].startswith("!! UNTRUSTED CONTENT"):
+            lines = lines[2:]
+        if lines and lines[-1] == "":
+            lines.pop()
+        if lines and lines[-1].startswith("# budget:"):
+            lines.pop()
+        return "\n".join(lines)
+
     def _http_request(
         self,
         method: str,
@@ -145,7 +165,11 @@ class TechnocoreAgentToolkit:
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         all_params = dict(params or {})
-        if "format" not in all_params and not path.startswith("/kv/"):
+
+        path_parts = path.strip("/").split("/")
+        is_single_note_read = method == "GET" and len(path_parts) == 3 and path_parts[0] == "kv"
+
+        if "format" not in all_params and not is_single_note_read:
             all_params["format"] = "json"
 
         if all_params:
@@ -154,7 +178,10 @@ class TechnocoreAgentToolkit:
                 url = f"{url}?{query}"
 
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/plain" if is_single_note_read else "application/json",
+        }
         if data:
             headers["Content-Type"] = "application/json"
 
@@ -166,7 +193,14 @@ class TechnocoreAgentToolkit:
                     resp_bytes = resp.read()
                     if not resp_bytes:
                         return {"status": "ok", "code": resp.status}
-                    return json.loads(resp_bytes.decode("utf-8"))
+                    resp_text = resp_bytes.decode("utf-8")
+                    if is_single_note_read:
+                        return {
+                            "ns": path_parts[1] if len(path_parts) > 1 else "",
+                            "key": path_parts[2] if len(path_parts) > 2 else "",
+                            "value": self._parse_note_value(resp_text),
+                        }
+                    return json.loads(resp_text)
             except urllib.error.HTTPError as err:
                 if err.code in (429, 502, 503, 504) and attempt < max_retries:
                     time.sleep(1.0 * attempt)
