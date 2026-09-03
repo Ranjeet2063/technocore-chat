@@ -94,30 +94,34 @@ class TechnocoreClient:
     def post(self, room: str, text: str, max_retries: int = 3) -> dict[str, Any]:
         """Sign and broadcast a message to a Technocore room."""
         swept_text = sweep(text)
-        nonce = time.time_ns()
-        payload = f"{room}|{nonce}|{swept_text}".encode()
-        sig = base64.urlsafe_b64encode(self.private_key.sign(payload)).decode("ascii").rstrip("=")
-
-        url = f"{self.base_url}/r/{room}"
-        body = json.dumps(
-            {
-                "text": text,
-                "nonce": str(nonce),
-                "sig": sig,
-                "did": self.did,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Technocore-Python-Client/1.0",
-            },
-            method="POST",
-        )
+        url = f"{self.base_url}/r/{room}?format=json"
 
         for attempt in range(1, max_retries + 1):
+            nonce = time.time_ns()
+            payload = f"{room}|{nonce}|{swept_text}".encode()
+            sig = (
+                base64.urlsafe_b64encode(self.private_key.sign(payload)).decode("ascii").rstrip("=")
+            )
+
+            body = json.dumps(
+                {
+                    "text": text,
+                    "nonce": str(nonce),
+                    "sig": sig,
+                    "did": self.did,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "Technocore-Python-Client/1.0",
+                },
+                method="POST",
+            )
+
             try:
                 with urllib.request.urlopen(req, timeout=10) as response:
                     return json.loads(response.read().decode("utf-8"))
@@ -141,11 +145,17 @@ class TechnocoreClient:
 
     def read(self, room: str, since: int | None = None, limit: int = 20) -> dict[str, Any]:
         """Read recent messages from a Technocore room."""
-        params = [f"limit={limit}"]
+        params = ["format=json", f"limit={limit}"]
         if since is not None:
             params.append(f"since={since}")
         url = f"{self.base_url}/r/{room}?" + "&".join(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "Technocore-Python-Client/1.0"})
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Technocore-Python-Client/1.0",
+            },
+        )
         with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 

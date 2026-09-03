@@ -145,7 +145,7 @@ class TechnocoreAgentToolkit:
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         all_params = dict(params or {})
-        if method == "GET" and "format" not in all_params:
+        if "format" not in all_params and not path.startswith("/kv/"):
             all_params["format"] = "json"
 
         if all_params:

@@ -100,6 +100,7 @@ def test_python_agent_client_post_payload_shape_and_sweep(monkeypatch, tmp_path)
     receipt = client.post("testroom", raw_text)
     assert receipt["ok"] is True
     assert receipt["posted"]["seq"] == 9999
+    assert posted_request["url"] == "https://technocore.chat/r/testroom?format=json"
 
     body = posted_request["body"]
     assert body["did"] == client.did
@@ -111,6 +112,126 @@ def test_python_agent_client_post_payload_shape_and_sweep(monkeypatch, tmp_path)
     server_swept = store.clean_text(body["text"])
     canonical_payload = f"testroom|{body['nonce']}|{server_swept}"
     didkey.verify(body["did"], body["sig"], canonical_payload)
+
+
+def test_technocore_client_real_asgi_post_and_read(monkeypatch, tmp_path):
+    """
+    Focused regression test exercising TechnocoreClient against real ASGI handlers.
+    Verifies that:
+      1. POST /r/<room>?format=json succeeds and returns structured JSON dict
+         (room, messages, count, posted) rather than plain text which causes JSONDecodeError.
+      2. GET /r/<room>?format=json&limit=... succeeds and returns structured JSON dict.
+      3. The message is verified on-chain / in-store and read back with identical author DID and text.
+      4. TechnocoreAgentToolkit also writes and reads structured data against real ASGI handlers.
+    """
+    import io
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from starlette.testclient import TestClient
+
+    import app as app_module
+    import config
+    import limit
+    import store
+
+    origin = time.monotonic()
+    monkeypatch.setattr(store, "_time_bucket", lambda now, ttl: int((now - origin) // ttl))
+    app_module._buckets.clear()
+    app_module._rooms_walk.cache_clear()
+    store._cached_window.cache_clear()
+    store._topics_memo.cache_clear()
+    app_module._identities.clear()
+    app_module._proxy_evidence["proxied_requests"] = 0
+    limit._dupes.clear()
+
+    with config.override(ROOT=tmp_path, DUPE_FILTER_SECONDS=0):
+        test_client = TestClient(app_module.app)
+
+        class ASGIResponse(io.BytesIO):
+            def __init__(self, content: bytes, status: int, headers: dict):
+                super().__init__(content)
+                self.status = status
+                self.headers = headers
+                self.code = status
+
+            def getcode(self):
+                return self.status
+
+            def info(self):
+                return self.headers
+
+        def asgi_urlopen(req, timeout=10):
+            url = req.full_url if hasattr(req, "full_url") else req
+            data = req.data if hasattr(req, "data") else None
+            headers = dict(req.headers) if hasattr(req, "headers") else {}
+            method = req.get_method() if hasattr(req, "get_method") else "GET"
+
+            parsed = urllib.parse.urlparse(url)
+            path = parsed.path
+            if parsed.query:
+                path += "?" + parsed.query
+
+            resp = test_client.request(
+                method=method,
+                url=path,
+                content=data,
+                headers=headers,
+            )
+
+            if resp.status_code >= 400:
+                raise urllib.error.HTTPError(
+                    url,
+                    resp.status_code,
+                    resp.reason_phrase,
+                    resp.headers,
+                    io.BytesIO(resp.content),
+                )
+
+            return ASGIResponse(resp.content, resp.status_code, dict(resp.headers))
+
+        monkeypatch.setattr(urllib.request, "urlopen", asgi_urlopen)
+
+        key_file = tmp_path / "integration_identity.pem"
+        client = TechnocoreClient(base_url="http://testserver", key_path=str(key_file))
+
+        # 1. Exercise post() against real ASGI handler
+        msg_text = "Verified message through real ASGI handler!"
+        post_receipt = client.post("regression-room", msg_text)
+
+        # Assert structured data returned (dict, not plain text string)
+        assert isinstance(post_receipt, dict)
+        assert post_receipt["room"] == "regression-room"
+        assert post_receipt["count"] == 1
+        assert "posted" in post_receipt
+        assert post_receipt["posted"]["seq"] == 1
+        assert post_receipt["posted"]["from"] == client.did
+        assert post_receipt["posted"]["text"] == msg_text
+
+        # 2. Exercise read() against real ASGI handler
+        read_receipt = client.read("regression-room")
+
+        assert isinstance(read_receipt, dict)
+        assert read_receipt["room"] == "regression-room"
+        assert "messages" in read_receipt
+        assert len(read_receipt["messages"]) == 1
+        msg = read_receipt["messages"][0]
+        assert msg["seq"] == 1
+        assert msg["from"] == client.did
+        assert msg["text"] == msg_text
+
+        # 3. Exercise TechnocoreAgentToolkit against real ASGI handlers
+        identity = TechnocoreIdentity(key_path=tmp_path / "toolkit_identity.pem")
+        toolkit = TechnocoreAgentToolkit(base_url="http://testserver", identity=identity)
+        tk_post = toolkit.post_message("regression-room", "Toolkit message via ASGI")
+        assert isinstance(tk_post, dict)
+        assert tk_post["posted"]["from"] == identity.did
+
+        tk_read = toolkit.read_room("regression-room")
+        assert isinstance(tk_read, dict)
+        assert len(tk_read["messages"]) == 2
 
 
 def test_generic_kv_set_unsigned(monkeypatch):
