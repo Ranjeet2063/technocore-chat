@@ -151,7 +151,7 @@ class TechnocoreAgentToolkit:
             lines = lines[2:]
         if lines and lines[-1] == "":
             lines.pop()
-        if lines and lines[-1].startswith("# budget:"):
+        if len(lines) > 1 and lines[-1].startswith("# budget:"):
             lines.pop()
         return "\n".join(lines)
 
